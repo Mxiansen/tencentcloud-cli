@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing version tag to build, for example v3.1.170.1rc1"
+        description: "Existing version tag to build, for example v3.1.170.1rc2"
         required: true
         type: string
       publish_release:
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: binary-prerelease-${{ github.repository }}-${{ inputs.tag }}
+  group: binary-release-${{ github.repository }}-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -32,14 +32,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-latest
             target: linux-x86_64
-          - os: windows-2022
-            target: windows-x86_64
-          - os: macos-15-intel
-            target: darwin-x86_64
-          - os: macos-14
+          - os: macos-latest
             target: darwin-arm64
+          - os: windows-latest
+            target: windows-x86_64
     steps:
       - name: Check out the requested tag
         uses: actions/checkout@v4
@@ -51,7 +49,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Validate tag and package version
         shell: bash
@@ -66,6 +64,11 @@ jobs:
           fi
 
           git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null
+          source_sha="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$source_sha" != "$(git rev-parse HEAD)" ]]; then
+            echo "checked-out source does not match ${RELEASE_TAG}" >&2
+            exit 1
+          fi
 
           release_version="${RELEASE_TAG#v}"
           project_version="$(python - <<'PY'
@@ -83,86 +86,80 @@ jobs:
           fi
 
           echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
-          echo "SOURCE_SHA=$(git rev-parse "${RELEASE_TAG}^{commit}")" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=${source_sha}" >> "$GITHUB_ENV"
 
-      - name: Install build dependencies
-        shell: bash
+      - name: Install dependencies (lightweight common SDK for binary)
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install \
-            --index-url https://pypi.org/simple/ \
-            --pre \
-            . \
-            "pyinstaller==6.11.1"
+          python -m pip install pyinstaller
+          python -m pip install tencentcloud-sdk-python-common jmespath six cos-python-sdk-v5
+          python -m pip install -e . --no-deps
 
-      - name: Build binary on Linux or macOS
-        if: runner.os != 'Windows'
+      - name: Run PyInstaller
+        if: runner.os != 'macOS'
+        run: >
+          python -m PyInstaller tccli/main.py -y -D
+          --collect-all tccli
+          --exclude-module tccli.examples
+          --name tccli
+
+      - name: Run PyInstaller on macOS
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          codesign_args=()
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            codesign_args=(--codesign-identity -)
-          fi
-
-          python -m PyInstaller \
-            --noconfirm \
-            --clean \
-            --onedir \
-            --name tccli \
-            --paths "$GITHUB_WORKSPACE" \
+          python -m PyInstaller tccli/main.py -y -D \
             --collect-all tccli \
-            --collect-all tencentcloud \
-            --collect-all certifi \
-            "${codesign_args[@]}" \
-            tccli/main.py
+            --exclude-module tccli.examples \
+            --codesign-identity - \
+            --name tccli
 
       - name: Re-sign and verify macOS bundle
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          bundle="$GITHUB_WORKSPACE/dist/tccli"
-          main_binary="$bundle/tccli"
-          python_library="$bundle/_internal/Python.framework/Versions/3.11/Python"
+          dist_dir="$GITHUB_WORKSPACE/dist/tccli"
+          main_binary="$dist_dir/tccli"
+          python_framework="$dist_dir/_internal/Python.framework"
+          python_library="$(find "$python_framework/Versions" -type f -name Python -print -quit)"
 
           test -x "$main_binary"
+          test -d "$python_framework"
+          test -n "$python_library"
           test -f "$python_library"
 
+          sign_macho() {
+            local binary="$1"
+            codesign --remove-signature "$binary" 2>/dev/null || true
+            codesign --force --sign - "$binary"
+          }
+
+          # Sign internal Mach-O files first, excluding the Python framework and main launcher.
           while IFS= read -r -d '' binary; do
-            if [[ "$binary" == "$main_binary" ]]; then
+            if [[ "$binary" == "$main_binary" || "$binary" == "$python_framework/"* ]]; then
               continue
             fi
             if file -b "$binary" | grep -q 'Mach-O'; then
-              codesign --remove-signature "$binary" 2>/dev/null || true
-              codesign --force --sign - "$binary"
+              sign_macho "$binary"
             fi
-          done < <(find "$bundle" -type f -print0)
+          done < <(find "$dist_dir" -type f -print0)
 
-          codesign --remove-signature "$main_binary" 2>/dev/null || true
-          codesign --force --sign - "$main_binary"
+          # Sign Python.framework contents, then the framework bundle itself.
+          while IFS= read -r -d '' binary; do
+            if file -b "$binary" | grep -q 'Mach-O'; then
+              sign_macho "$binary"
+            fi
+          done < <(find "$python_framework" -type f -print0)
+          codesign --remove-signature "$python_framework" 2>/dev/null || true
+          codesign --force --sign - "$python_framework"
+
+          # Sign the launcher last, after all libraries it loads are finalized.
+          sign_macho "$main_binary"
 
           codesign --verify --deep --strict --verbose=4 "$main_binary"
+          codesign --verify --strict --verbose=4 "$python_framework"
           codesign --verify --strict --verbose=4 "$python_library"
-
-      - name: Build binary on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          python -m PyInstaller `
-            --noconfirm `
-            --clean `
-            --onedir `
-            --name tccli `
-            --paths $env:GITHUB_WORKSPACE `
-            --collect-all tccli `
-            --collect-all tencentcloud `
-            --collect-all certifi `
-            tccli/main.py
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
 
       - name: Smoke test binary on Linux or macOS
         if: runner.os != 'Windows'
@@ -229,8 +226,9 @@ jobs:
     name: Publish GitHub pre-release
     needs: build
     if: ${{ inputs.publish_release }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Check out the requested tag
@@ -253,6 +251,11 @@ jobs:
           fi
 
           git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null
+          source_sha="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$source_sha" != "$(git rev-parse HEAD)" ]]; then
+            echo "checked-out source does not match ${RELEASE_TAG}" >&2
+            exit 1
+          fi
 
           release_version="${RELEASE_TAG#v}"
           project_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' pyproject.toml)"
@@ -262,7 +265,7 @@ jobs:
           fi
 
           echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
-          echo "SOURCE_SHA=$(git rev-parse "${RELEASE_TAG}^{commit}")" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=${source_sha}" >> "$GITHUB_ENV"
 
       - name: Download platform artifacts
         uses: actions/download-artifact@v4
