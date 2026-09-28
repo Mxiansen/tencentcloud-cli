@@ -27,7 +27,7 @@ def main():
     else:
         vinput = raw_input
     cli_version = __version__.rsplit(".", 1)[0]
-    dep_sdk = "tencentcloud-sdk-python-common"
+    dep_sdk = "tencentcloud-sdk-python-internal"
     if SDK_VERSION is not None:
         if int(SDK_VERSION.split(".")[-1]) < int(cli_version.split(".")[-1]):
             answer = None
